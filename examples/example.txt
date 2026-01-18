@@ -1,0 +1,45 @@
+{//: This is a comment!
+
+Comments are ignored and not considered in the output it even can contain {}, however make sure to close the bracets in the coment if you put it there.
+}
+
+This is an example ! 
+
+If you are not using a json file, you can use a text file with a json block.
+The entrypoint is
+
+```json
+{
+    "templates": {
+        "data": {
+            "fixed_value": "a fixed value",
+            "colors": [
+                "red", "green", "blue"
+            ]
+        }
+    }
+}
+```
+
+test one: {fixed_value}
+
+```template.a_long_text
+I do not want to put this text inside a json file because it has many lines, and formating json it's not pleaseant.
+By the way my favorite color is {colors}
+```
+
+test two:
+{a_long_text}
+
+
+You can access arguments passed to the generation like, meta_my_argument: {meta_my_argument}
+
+You can take decision based on the pass number like {==:meta_pass_number|1|Let me put this text|Let me put another text!}
+
+You passed a list for the template, each one receive one from that list, name of the list "my_counting" I reveived the text "{meta_current_my_counting}". Note Continuations received the same value :D
+
+{==:meta_pass_number|0|Lets set a value to use in the next continuation: {set:value_of_prior_pass|Last value}}
+{==:meta_pass_number|1|Lets check the a value from a previous pass: {opt:meta_last_value_of_prior_pass|I did not found the value set :()}}
+
+
+

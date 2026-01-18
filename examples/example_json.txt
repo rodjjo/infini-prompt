@@ -1,0 +1,18 @@
+{
+    "entrypoint": "The {building} is on {condition} .",
+    "templates": {
+        "data": {
+            "building": [
+                "house",
+                "hospital",
+                "hotel",
+                "restaurant"
+            ],
+            "condition": [
+                "fire",
+                "ruins",
+                "perfect state"
+            ]
+        }
+    }
+}

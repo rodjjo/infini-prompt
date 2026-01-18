@@ -1,0 +1,26 @@
+A {animal} is {action} at the {location}.
+
+```json
+{
+    "templates": {
+        "data": {
+            "animal": [
+                "dog",
+                "cat",
+                "monkey",
+                "capibara"
+            ],
+            "action": [
+                "running",
+                "walking",
+                "hunting"
+            ],
+            "location": [
+                "forest",
+                "beach",
+                "desert"
+            ]
+        }
+    }
+}
+```
