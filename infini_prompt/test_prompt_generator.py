@@ -12,6 +12,8 @@ import copy
 import time
 import pytest
 import copy
+from unittest.mock import patch
+import unittest.mock
 
 # Import the functions to test
 from infini_prompt.prompt_generator import (
@@ -22,8 +24,14 @@ from infini_prompt.prompt_generator import (
     escape_special_characters,
 )
 
+
 class TestGeneratePrompt(unittest.TestCase):
     """Test suite for generate_prompt function and all operators."""
+
+    def setUp(self):
+        """Reset global state before each test."""
+        from infini_prompt.prompt_generator import GLOBAL_UNIQUE_STATE
+        GLOBAL_UNIQUE_STATE.clear()
 
     def test_simple_entrypoint(self):
         """Test basic prompt generation with simple entrypoint."""
@@ -195,6 +203,38 @@ class TestGeneratePrompt(unittest.TestCase):
         self.assertTrue(len(unique_parts) <= 2)  # At most 2 unique items
         for part in parts:
             self.assertIn(part, ["x", "y"])
+
+    def test_global_exclusive_operator(self):
+        """Test @@ (global exclusive) operator - ensures exclusiveness across multiple generate_prompt calls."""
+        template = {
+            "entrypoint": "{@@:fruit}",
+            "templates": {
+                "data": {
+                    "fruit": ["apple", "banana", "orange"]
+                }
+            }
+        }
+        # First call
+        result1 = generate_prompt(template, seed=123)
+        fruit1 = result1["output"]
+        self.assertIn(fruit1, ["apple", "banana", "orange"])
+        
+        # Second call - should not repeat the first fruit
+        result2 = generate_prompt(template, seed=456)
+        fruit2 = result2["output"]
+        self.assertIn(fruit2, ["apple", "banana", "orange"])
+        self.assertNotEqual(fruit1, fruit2)
+        
+        # Third call - should not repeat the previous fruits
+        result3 = generate_prompt(template, seed=789)
+        fruit3 = result3["output"]
+        self.assertIn(fruit3, ["apple", "banana", "orange"])
+        self.assertNotIn(fruit3, [fruit1, fruit2])
+        
+        # Fourth call - should reset and allow repeats since all options exhausted
+        result4 = generate_prompt(template, seed=101)
+        fruit4 = result4["output"]
+        self.assertIn(fruit4, ["apple", "banana", "orange"])
 
     def test_static_operator(self):
         """Test $ (static) operator - keeps same value across uses."""
@@ -1905,6 +1945,142 @@ End of template."""
         self.assertIn("image", result["output"])
         self.assertTrue(any(color in result["output"] for color in ["red", "blue", "green"]))
         self.assertTrue(any(animal in result["output"] for animal in ["cat", "dog", "bird"]))
+
+    @patch('builtins.print')
+    def test_echo_operator(self, mock_print):
+        """Test echo operator prints the text and returns empty string."""
+        template = {
+            "entrypoint": "Before {echo:Hello World} After",
+            "templates": {
+                "data": {}
+            }
+        }
+        result = generate_prompt(template, seed=42)
+        mock_print.assert_has_calls([
+            unittest.mock.call("<<BEGIN_ECHO>>"),
+            unittest.mock.call("Hello World"),
+            unittest.mock.call("<<END_ECHO>>")
+        ])
+        self.assertEqual(result["output"], "Before After")
+
+    @patch('builtins.print')
+    def test_print_operator(self, mock_print):
+        """Test print operator (alias for echo) prints the text."""
+        template = {
+            "entrypoint": "{print:Test message}",
+            "templates": {
+                "data": {}
+            }
+        }
+        result = generate_prompt(template, seed=42)
+        mock_print.assert_has_calls([
+            unittest.mock.call("<<BEGIN_ECHO>>"),
+            unittest.mock.call("Test message"),
+            unittest.mock.call("<<END_ECHO>>")
+        ])
+        self.assertEqual(result["output"], "")
+
+    @patch('builtins.print')
+    def test_echo_operator_with_processing(self, mock_print):
+        """Test echo operator processes nested operators before printing."""
+        template = {
+            "entrypoint": "{echo:{color} sky}",
+            "templates": {
+                "data": {
+                    "color": ["blue", "red"]
+                }
+            }
+        }
+        result = generate_prompt(template, seed=42)
+        # Should have called print with the processed text
+        self.assertTrue(mock_print.called)
+        # Check the second call which is the actual message
+        self.assertEqual(len(mock_print.call_args_list), 3)
+        called_with = mock_print.call_args_list[1][0][0]
+        self.assertIn(called_with, ["blue sky", "red sky"])
+        self.assertEqual(result["output"], "")
+
+    def test_conditional_operator_true(self):
+        """Test conditional operator returns text when condition matches."""
+        template = {
+            "entrypoint": "Start {cond:status|active|is active} End",
+            "templates": {
+                "data": {
+                    "status": "active"
+                }
+            }
+        }
+        result = generate_prompt(template, seed=42)
+        self.assertEqual(result["output"], "Start is active End")
+
+    def test_conditional_operator_false(self):
+        """Test conditional operator returns empty when condition doesn't match."""
+        template = {
+            "entrypoint": "Start {cond:status|inactive|is inactive} End",
+            "templates": {
+                "data": {
+                    "status": "active"
+                }
+            }
+        }
+        result = generate_prompt(template, seed=42)
+        self.assertEqual(result["output"], "Start End")
+
+    def test_if_operator_alias(self):
+        """Test 'if' operator as alias for 'cond'."""
+        template = {
+            "entrypoint": "{if:mode|test|Testing mode}",
+            "templates": {
+                "data": {
+                    "mode": "test"
+                }
+            }
+        }
+        result = generate_prompt(template, seed=42)
+        self.assertEqual(result["output"], "Testing mode")
+
+    def test_conditional_operator_with_processing(self):
+        """Test conditional operator processes nested operators in text part."""
+        template = {
+            "entrypoint": "{cond:flag|yes|Selected {color}}",
+            "templates": {
+                "data": {
+                    "flag": "yes",
+                    "color": ["red", "blue"]
+                }
+            }
+        }
+        result = generate_prompt(template, seed=42)
+        self.assertIn("Selected", result["output"])
+        self.assertTrue(any(color in result["output"] for color in ["red", "blue"]))
+
+    def test_conditional_operator_value_with_braces_error(self):
+        """Test conditional operator raises error when value contains braces."""
+        template = {
+            "entrypoint": "{cond:key|{invalid}|text}",
+            "templates": {
+                "data": {
+                    "key": "value"
+                }
+            }
+        }
+        with self.assertRaises(PromptError) as context:
+            generate_prompt(template, seed=42)
+        self.assertIn("Conditional operator value cannot contain '{' characters", str(context.exception))
+
+    def test_conditional_operator_missing_parts(self):
+        """Test conditional operator with insufficient parts raises error."""
+        template = {
+            "entrypoint": "{cond:key|value}",
+            "templates": {
+                "data": {
+                    "key": "value"
+                }
+            }
+        }
+        with self.assertRaises(PromptError) as context:
+            generate_prompt(template, seed=42)
+        self.assertIn("Conditional operator requires key|value|text format", str(context.exception))
 
 
 if __name__ == "__main__":

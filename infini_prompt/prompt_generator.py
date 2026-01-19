@@ -1,3 +1,4 @@
+import sys
 import os
 import json
 import random
@@ -8,13 +9,16 @@ import re
 from tqdm import tqdm
 
 
-
 class PromptError(Exception):
+    """Custom exception for prompt generation errors."""
     pass
 
-def enhance_prompt(prompt: str, enhancements: dict) -> str:
-    # not implemented yet
-    return prompt
+
+def debug_print(text: str):
+    print("<<BEGIN_ECHO>>")
+    print(text)
+    print("<<END_ECHO>>")
+    sys.stdout.flush()
 
 ESCAPE_MAPPINGS = {
     "|": "&pipe;",
@@ -34,6 +38,8 @@ QUANTITATIVE_OPERATORS = GREATER_OPERATORS + LESS_OPERATORS + GREATER_EQUAL_OPER
 ONE_OF_OPERATORS = ["one_of", "choice", "select", "any", "any_of", "pick_one"]
 STORE_OPERATORS = ["set", "store", ":="]
 REPEAT_OPERATORS = ["repeat", "x"]
+ECHO_OPERATORS = ["echo", "print"]
+COND_OPERATORS = ["cond", "if"]
 MAYBE_OPERATORS = ["maybe", "?"]
 IN_OPERATOR = ["in", "not_in"]
 HAS_OPERATOR = ["has", "not_has"]
@@ -47,6 +53,8 @@ OPERATOR_ERROR = "error"
 OPERATOR_COALESCE = "!"
 OPERATOR_EXCEPT = "^"
 OPERATOR_LITERAL = "#"
+
+GLOBAL_UNIQUE_STATE = {}
 
 
 
@@ -62,12 +70,44 @@ def unescape_special_characters(text: str) -> str:
 
 
 def click_args_to_kwargs(args: typing.List[str]) -> dict:
-    """Converts a list of command-line arguments to a dictionary of keyword arguments."""
+    """
+    Converts a list of command-line arguments to a dictionary of keyword arguments.
+    Supports:
+      --arg=value
+      --arg value
+      -a value
+      -b=value
+      --flag (sets to True)
+      -f (sets to True)
+    """
     kwargs = {}
-    for arg in args:
-        if '=' in arg:
-            name, value = arg.split('=', 1)
-            kwargs[name] = value
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--"):
+            if "=" in arg:
+                name, value = arg[2:].split("=", 1)
+                kwargs[name] = value
+            else:
+                name = arg[2:]
+                # Check if next argument exists and is not another flag
+                if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                    kwargs[name] = args[i + 1]
+                    i += 1
+                else:
+                    kwargs[name] = True
+        elif arg.startswith("-") and len(arg) > 1:
+            if "=" in arg:
+                name, value = arg[1:].split("=", 1)
+                kwargs[name] = value
+            else:
+                name = arg[1:]
+                if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                    kwargs[name] = args[i + 1]
+                    i += 1
+                else:
+                    kwargs[name] = True
+        i += 1
     return kwargs
 
 
@@ -172,7 +212,7 @@ def select_normal(name: str, state: dict) -> str:
     return choice
 
 
-def select_exclusive(name: str, state: dict, prefix: str= "") -> str:
+def select_exclusive(name: str, state: dict, prefix: str= "", is_global: bool = False) -> str:
     # select one of the exclusive options from state data
     if name not in state["data"]:
         raise PromptError(f"Exclusive selection key '{name}' not found in state data.")
@@ -185,22 +225,39 @@ def select_exclusive(name: str, state: dict, prefix: str= "") -> str:
     data = options[:]
     # lets remove from data any options that were used in state usage
     name_prefix = prefix + name
-    used_options = state.get("usage", {}).get(name_prefix, [])
+    if is_global:
+        global GLOBAL_UNIQUE_STATE
+        if "usage" not in GLOBAL_UNIQUE_STATE:
+            GLOBAL_UNIQUE_STATE["usage"] = {}
+        used_options = GLOBAL_UNIQUE_STATE["usage"].get(name_prefix, [])
+    else:
+        used_options = state.get("usage", {}).get(name_prefix, [])
     data = [opt for opt in data if opt not in used_options]
     
     if not data:
         # lets clean up the usage and use all options again
-        state["usage"][name_prefix] = []
+        if is_global:
+            GLOBAL_UNIQUE_STATE["usage"][name_prefix] = []
+        else:
+            state["usage"][name_prefix] = []
         data = options[:]
     options = data
     # now we can select a random choice from options
     choice = random.choice(options)
     # lets add the choice to the usage
-    if "usage" not in state:
-        state["usage"] = {}
-    if name_prefix not in state["usage"]:
-        state["usage"][name_prefix] = []
-    state["usage"][name_prefix].append(choice)
+    if is_global:
+        if "usage" not in GLOBAL_UNIQUE_STATE:
+            GLOBAL_UNIQUE_STATE["usage"] = {}
+        if name_prefix not in GLOBAL_UNIQUE_STATE["usage"]:
+            GLOBAL_UNIQUE_STATE["usage"][name_prefix] = []
+        GLOBAL_UNIQUE_STATE["usage"][name_prefix].append(choice)
+    else:
+        if "usage" not in state:
+            state["usage"] = {}
+        if name_prefix not in state["usage"]:
+            state["usage"][name_prefix] = []
+        state["usage"][name_prefix].append(choice)
+
     if "{" in choice:
         choice = process_prompt(choice, state)
     return choice
@@ -412,6 +469,26 @@ def operator_ignore(text: str, state: dict) -> str:
     # always return empty string
     return ""
 
+
+def operator_conditional(key, value, text: str, state: dict) -> str:
+    # if the key's value equals value, return text, else return empty
+    key = key.strip()
+    value = value.strip()
+    key_value = select_normal(key, state)
+    if "{" in value:
+        raise PromptError("Conditional operator value cannot contain '{' characters.")
+    if key_value == value:
+        if "{" in text:
+            text = process_prompt(text, state)
+        return text
+    return ""
+
+def operator_echo(text: str, state: dict) -> str:
+    if "{" in text:
+        text = process_prompt(text, state)
+    debug_print(text)
+    return ""
+
 def resolve_operator(text: str, state: dict) -> str:
     # state is a dictionary with 
     # data, static, regex, paths and usage keys
@@ -424,6 +501,9 @@ def resolve_operator(text: str, state: dict) -> str:
     operator, _, argument = text.partition(":")
     if operator in ONE_OF_OPERATORS:
         return operator_one_of(argument, state)
+    elif operator.endswith("@@"):
+        prefix = operator[:-2]
+        return select_exclusive(argument.strip(), state, prefix=prefix, is_global=True)
     elif operator.endswith("@"):
         prefix = operator[:-1]
         return select_exclusive(argument.strip(), state, prefix=prefix)
@@ -620,12 +700,33 @@ def resolve_operator(text: str, state: dict) -> str:
         # syntaxes: {comment:text} or {//:text}
         # we just return empty string
         return ""
+    elif operator in COND_OPERATORS:
+        # syntaxes: {cond:key|value|text} or {if:key|value|text}
+        parts = argument.split("|")
+        if len(parts) < 3:
+            raise PromptError(f"Conditional operator requires key|value|text format: '{argument}'")
+        key = parts[0].strip()
+        value = parts[1].strip()
+        text = parts[2]
+        return operator_conditional(key, value, text, state)
+    elif operator in ECHO_OPERATORS:
+        # syntaxes: {echo:text} or {print:text}
+        text = argument
+        return operator_echo(text, state)
     else:
         raise PromptError(f"Unknown operator '{operator}' in prompt.")
 
 def process_prompt(prompt: str, state: dict, inside_bracets=False) -> str:
-    if inside_bracets and (prompt.startswith("comment:") or prompt.startswith("//:")):
-        return ""
+    if inside_bracets: 
+        if prompt.startswith(tuple(f"{op}:" for op in COMMENT_OPERATORS)):
+            return ""
+        if prompt.startswith(tuple(f"{op}:" for op in COND_OPERATORS)):
+            prompt = prompt[len(prompt.partition(":")[0]) + 1 :]
+            parts = prompt.split("|")
+            if len(parts) < 3:
+                raise PromptError(f"Conditional operator requires key|value|text format: '{prompt}'")
+            key, value, text = parts[0], parts[1], "|".join(parts[2:])
+            return operator_conditional(key, value, text, state)
     result = prompt
     while "{" in result:
         inner_content = eat_next_bracets(result)
@@ -877,9 +978,15 @@ def resolve_tree_of_tags(entrypoint: dict, kwargs: dict) -> str:
 
 def ensure_template_dict(template: typing.Union[str, dict]) -> dict:
     if isinstance(template, dict):
+        if "templates" not in template:
+            template["templates"] = {
+                "data": {}
+            }
+        elif "data" not in template["templates"]:
+            template["templates"]["data"] = {}
         return template
     elif not isinstance(template, str):
-        raise Exception("Template must be a dictionary or a string.")
+        raise PromptError("Template must be a dictionary or a string.")
     template = template.strip()
     # lets check if it starts with "{"
     if template.startswith("{"):
@@ -902,76 +1009,78 @@ def ensure_template_dict(template: typing.Union[str, dict]) -> dict:
     #   }
     # }
     # ```
-    # all the text outside the ```json ... ``` is the entrypoint text that we be added to the extracted json at the field "entrypoint"
+    # or
+    # ```template.key_name
+    # content of the template
+    # ```
+    # all the text outside the ```json ... ``` and ```template... ``` is the entrypoint text that will be added to the extracted json at the field "entrypoint"
     lines = template.splitlines()
     inside_json_block = False
     inside_template_block = False
-    current_template_key = None
-    json_lines = []
-    template_lines = []
+    json_block_lines = []
+    template_block_lines = []
     entrypoint_lines = []
-    templates_to_set = {}
-    code_block_found = False
+    json_block_found = False
+    current_template_name = None
+    template_data = {}
     for line in lines:
         stripped_line = line.strip()
         if stripped_line.startswith("```json"):
-            if code_block_found:
-                raise Exception("Multiple JSON code blocks found in template string.")
+            if json_block_found:
+                raise PromptError("Multiple JSON code blocks found in template string.")
             inside_json_block = True
-            code_block_found = True
-            inside_template_block = False
-            json_lines = []
+            json_block_found = True
             continue
         elif stripped_line.startswith("```template."):
-            if inside_json_block:
-                raise Exception("Template blocks must be before JSON block.")
             if inside_template_block:
-                # finish previous template block
-                content = "\n".join(template_lines).strip()
-                templates_to_set[current_template_key] = content
-                template_lines = []
-            # start new template block
-            key_part = stripped_line[len("```template.") : ].strip()
-            current_template_key = key_part
+                raise PromptError("Nested template blocks found in template string.")
             inside_template_block = True
-            template_lines = []
+            template_name = stripped_line[len("```template."):].strip()
+            if not template_name:
+                raise PromptError("Template block must have a name after '```template.'.")
+            current_template_name = template_name
+            template_block_lines = []
             continue
-        elif stripped_line.startswith("```") and (inside_json_block or inside_template_block):
-            if inside_template_block:
-                content = "\n".join(template_lines).strip()
-                templates_to_set[current_template_key] = content
-                inside_template_block = False
-                current_template_key = None
-                template_lines = []
-            elif inside_json_block:
-                inside_json_block = False
+        elif stripped_line.startswith("```") and inside_json_block:
+            inside_json_block = False
+            continue
+        elif stripped_line.startswith("```") and inside_template_block:
+            inside_template_block = False
+            if current_template_name:
+                template_data[current_template_name] = "\n".join(template_block_lines).strip()
+            current_template_name = None
             continue
         if inside_json_block:
-            json_lines.append(line)
+            json_block_lines.append(line)
         elif inside_template_block:
-            template_lines.append(line)
+            template_block_lines.append(line)
         else:
             entrypoint_lines.append(line)
-    if inside_json_block or inside_template_block:
-        raise Exception("Unclosed code block in template string.")
-    code_block_content = "\n".join(json_lines).strip()
+    if inside_template_block:
+        raise PromptError("Unclosed template block in template string.")
+    json_block_content = "\n".join(json_block_lines).strip()
     entrypoint_content = "\n".join(entrypoint_lines).strip()
-    if not code_block_content:
-        raise Exception("No JSON code block found in template string.")
-    try:
-        template_dict = json.loads(code_block_content)
-    except Exception as e:
-        raise Exception(f"Failed to parse JSON code block in template string: {e}")
+    if not json_block_content and not template_data:
+        raise PromptError("No JSON code block or template blocks found in template string.")
+    if json_block_content:
+        try:
+            template_dict = json.loads(json_block_content)
+        except Exception as e:
+            raise PromptError(f"Failed to parse JSON code block in template string: {e}")
+    else:
+        template_dict = {}
     if entrypoint_content:
         template_dict["entrypoint"] = entrypoint_content
     else:
-        raise Exception("No entrypoint content found outside JSON code block in template string.")
-    # now, set the templates
+        raise PromptError("No entrypoint content found outside code blocks in template string.")
     if "templates" not in template_dict:
-        template_dict["templates"] = {}
-    if "data" not in template_dict["templates"]:
+        template_dict["templates"] = {
+            "data": {}
+        }
+    elif "data" not in template_dict["templates"]:
         template_dict["templates"]["data"] = {}
-    for key, value in templates_to_set.items():
+    # Add template data to the template dict
+    for key, value in template_data.items():
         template_dict["templates"]["data"][key] = value
     return template_dict
 
@@ -1007,8 +1116,7 @@ def generate_prompt(
         num_continues: int = 0,
 ) -> dict:
     template = ensure_template_dict(template)
-    kwargs = copy.deepcopy(kwargs)
-    if seed is None:
+    if seed is None or seed < 1:
         seed = int(time.time() * 1000) + random.randint(0, 1 << 30)
     if num_prompts < 1:
         num_prompts = 1
@@ -1057,7 +1165,7 @@ def generate_prompt(
                 index = p_number % len(values)
                 kwargs[f"current_{name}"] = values[index]
         for pass_number in range(num_continues + 1):
-            kwargs["pass_number"] = str(pass_number)
+            kwargs["pass_number"] = str(pass_number + 1)
             kwargs.update(meta_lasts)
             current_template = copy.deepcopy(template)
             generated = _generate_prompt_implementation(
@@ -1093,9 +1201,9 @@ def generate_prompt(
                 for key, value in last_prompt.get("statics", {}).items():
                     if key.startswith("meta_last_"):
                         continue
-                    meta_lasts[f"meta_last_{key}"] = value
+                    meta_lasts[f"last_{key}"] = value
                 # we also store the last output as meta_last_output
-                meta_lasts["meta_last_output"] = last_prompt.get("output", "")
+                meta_lasts["last_output"] = last_prompt.get("output", "")
 
     if progress:
         progress.close()
