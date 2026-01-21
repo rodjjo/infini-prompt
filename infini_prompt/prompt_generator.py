@@ -8,11 +8,12 @@ import copy
 import re
 from tqdm import tqdm
 
+def enhance_prompt(text: str) -> str: 
+    return text
 
 class PromptError(Exception):
-    """Custom exception for prompt generation errors."""
+    """Custom exception for prompt-related errors."""
     pass
-
 
 def debug_print(text: str):
     print("<<BEGIN_ECHO>>")
@@ -47,12 +48,18 @@ TRACK_OPERATORS = ["track", "tk"]
 OPTIONAL_OPERATORS = ["optional", "opt"]
 IGNORE_OPERATORS = ["ignore", "ign", "empty"]
 COMMENT_OPERATORS = ["comment", "//"]
+HOOKS_OPERATORS = ["hook", "call", "exec"]
+INCREMENT_OPERATORS = ["++", "inc", "increment"]
+DECREMENT_OPERATORS = ["--", "dec", "decrement"]
 OPERATOR_CASE = "case"
 OPERATOR_EVAL = "*"
 OPERATOR_ERROR = "error"
 OPERATOR_COALESCE = "!"
 OPERATOR_EXCEPT = "^"
 OPERATOR_LITERAL = "#"
+OPERATOR_SUM = "+"
+OPERATOR_SUBTRACT = "-"
+
 
 GLOBAL_UNIQUE_STATE = {}
 
@@ -109,6 +116,30 @@ def click_args_to_kwargs(args: typing.List[str]) -> dict:
                     kwargs[name] = True
         i += 1
     return kwargs
+
+
+def split_args_same_level(text: str, separator: str = "|") -> list:
+    parts = []
+    current_part = ""
+    level = 0
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == '{':
+            level += 1
+            current_part += char
+        elif char == '}':
+            level -= 1
+            current_part += char
+        elif char == separator and level == 0:
+            parts.append(current_part)
+            current_part = ""
+        else:
+            current_part += char
+        i += 1
+    if current_part:
+        parts.append(current_part)
+    return parts
 
 
 def process_entrypoint_list(value: list) -> str:
@@ -276,7 +307,6 @@ def select_static(name: str, state: dict, prefix="") -> str:
     return result
 
 def operator_maybe(text: str, chance: int = 50) -> str:
-    text = text.strip()
     if random.randint(1, 100) <= chance:
         return text
     return ""
@@ -287,13 +317,20 @@ def selector_except(key: str, exclude_key: str, state: dict, default: str) -> st
     """
     key = key.strip()
     exclude_key = exclude_key.strip()
-    if key not in state["data"]:
+    if key not in state["data"] and "{" not in key:
         raise PromptError(f"Selection key '{key}' not found in state data.")
-    if "," not in exclude_key and exclude_key not in state["data"]:
+    if "," not in exclude_key and "{" not in exclude_key and exclude_key not in state["data"]:
         raise PromptError(f"Exclude selection key '{exclude_key}' not found in state data.")
-    options = state["data"][key]
-    if isinstance(options, str):
-        options = [options]
+    if "{" in key:
+        options = process_prompt(key, state)
+        if "," in options:
+            options = split_args_same_level(options, ",")
+        else:
+            options = [options]
+    else:
+        options = state["data"][key]
+        if isinstance(options, str):
+            options = [options]
     if not isinstance(options, list):
         raise PromptError(f"Selection key '{key}' must be a list or string.")
     if not options:
@@ -301,12 +338,19 @@ def selector_except(key: str, exclude_key: str, state: dict, default: str) -> st
     options = [
         opt if "{" not in opt else process_prompt(opt, state) for opt in options
     ]
-    if "," in exclude_key:
-        options_exclude = exclude_key.split(",")
+    if "{" in exclude_key:
+        options_exclude = process_prompt(exclude_key, state)
+        if "," in options_exclude:
+            options_exclude = split_args_same_level(options_exclude, ",")
+        else:
+            options_exclude = [options_exclude]
     else:
-        options_exclude = state["data"][exclude_key]
-    if isinstance(options_exclude, str):
-        options_exclude = [options_exclude]
+        if "," in exclude_key:
+            options_exclude = split_args_same_level(exclude_key, ",")
+        else:
+            options_exclude = state["data"][exclude_key]
+        if isinstance(options_exclude, str):
+            options_exclude = [options_exclude]
     options_exclude = [
         opt if "{" not in opt else process_prompt(opt, state) for opt in options_exclude if opt.strip()
     ]
@@ -403,7 +447,7 @@ def operator_case(text: str, state: dict, prefix: str, default: str, case_values
 
 def operator_one_of(text: str, state: dict) -> str:
     # select one of the options from a pipe separated list
-    options = [v.strip() for v in text.split("|")]
+    options = split_args_same_level(text, "|")
     if not options:
         return ""
     option = random.choice(options)
@@ -489,11 +533,89 @@ def operator_echo(text: str, state: dict) -> str:
     debug_print(text)
     return ""
 
+def operator_hook(name: str, text: str, state: dict) -> str:
+    # call a hook from the template hooks
+    if "hooks" not in state:
+        raise PromptError("No hooks defined in state.")
+    hooks = state["hooks"]
+    if name not in hooks:
+        raise PromptError(f"Hook '{name}' not found in state hooks.")
+    hook_fn = hooks[name]
+    if "{" in text:
+        text = process_prompt(text, state)
+    result = hook_fn(text)
+    if "{" in result:
+        result = process_prompt(result, state)
+    return result
+
+def operator_increment(key: str, state: dict, prefix: str="") -> str:
+    # increment a static numeric value
+    if "static" not in state:
+        state["static"] = {}
+    name = prefix + key
+    if name not in state["static"]:
+        state["static"][name] = "0"
+    try:
+        value = int(state["static"][name])
+    except ValueError:
+        raise PromptError(f"Cannot increment non-numeric static value for key '{name}': '{state['static'][name]}'")
+    value += 1
+    state["static"][name] = str(value)
+    return str(value)
+
+def operator_decrement(key: str, state: dict, prefix: str="") -> str:
+    # decrement a static numeric value
+    if "static" not in state:
+        state["static"] = {}
+    name = prefix + key
+    if name not in state["static"]:
+        state["static"][name] = "0"
+    try:
+        value = int(state["static"][name])
+    except ValueError:
+        raise PromptError(f"Cannot decrement non-numeric static value for key '{name}': '{state['static'][name]}'")
+    value -= 1
+    state["static"][name] = str(value)
+    return str(value)
+
+def operator_sum(left: str, right: str, state: dict) -> str:
+    # sum two numeric values
+    left = left.strip()
+    right = right.strip()
+    if "{" in left:
+        left = process_prompt(left, state)
+    if "{" in right:
+        right = process_prompt(right, state)
+    try:
+        result = float(left) + float(right)
+    except ValueError:
+        raise PromptError(f"Cannot sum non-numeric values: '{left}' and '{right}'")
+    if result.is_integer():
+        return str(int(result))
+    return str(result)
+
+def operator_subtract(left: str, right: str, state: dict) -> str:
+    # subtract two numeric values
+    left = left.strip()
+    right = right.strip()
+    if "{" in left:
+        left = process_prompt(left, state)
+    if "{" in right:
+        right = process_prompt(right, state)
+    try:
+        result = float(left) - float(right)
+    except ValueError:
+        raise PromptError(f"Cannot subtract non-numeric values: '{left}' and '{right}'")
+    if result.is_integer():
+        return str(int(result))
+    return str(result)
+
 def resolve_operator(text: str, state: dict) -> str:
     # state is a dictionary with 
     # data, static, regex, paths and usage keys
     if ":" not in text:
-        if "|" in text:
+        parts = split_args_same_level(text, "|")
+        if len(parts) > 1:
             return operator_one_of(text, state)
         # simple state lookup
         key = text.strip()
@@ -517,7 +639,7 @@ def resolve_operator(text: str, state: dict) -> str:
         return argument
     elif operator == OPERATOR_ERROR:
         # Format: {error:key|compare_value}
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"Error operator requires key|value format: '{argument}'")
         key = parts[0].strip()
@@ -526,7 +648,7 @@ def resolve_operator(text: str, state: dict) -> str:
     elif operator in EQUALITY_OPERATORS:
         negative = operator in INEQUAL_OPERATORS
         # Format: {==:key|compare_value|true_result|false_result}
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"Equality operator requires at least key|value format: '{argument}'")
         key = parts[0].strip()
@@ -538,7 +660,7 @@ def resolve_operator(text: str, state: dict) -> str:
         negative = operator in ["<", "lt", "<=", "lte"]
         exact = operator in [">=", "gte", "<=", "lte"]
         # Format: {>:key|compare_value|true_result|false_result}
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"Quantitative operator requires at least key|value format: '{argument}'")
         key = parts[0].strip()
@@ -549,7 +671,7 @@ def resolve_operator(text: str, state: dict) -> str:
     elif operator in IN_OPERATOR:
         negative = operator == "not_in"
         # Format: {in:key|list_value|true_result|false_result}
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"In operator requires at least key|list format: '{argument}'")
         key = parts[0].strip()
@@ -560,7 +682,7 @@ def resolve_operator(text: str, state: dict) -> str:
     elif operator in HAS_OPERATOR:
         negative = operator == "not_has"
         # Format: {has:key|substrings|true_result|false_result}
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"Has operator requires at least key|substrings format: '{argument}'")
         key = parts[0].strip()
@@ -573,7 +695,7 @@ def resolve_operator(text: str, state: dict) -> str:
         default = ""
         case_values = []
         if "|" in argument:
-            parts = argument.split("|")
+            parts = split_args_same_level(argument, "|")
             if len(parts) >= 2:
                 prefix = parts[1]
             if len(parts) >= 3:
@@ -585,11 +707,13 @@ def resolve_operator(text: str, state: dict) -> str:
         # Eval operator: resolve the argument (which may contain {}) first,
         # then use the result as a key to look up
         # {*:{animal}} -> resolves {animal} to "dog", then looks up "dog" in data
+        if "{" in argument:
+            argument = process_prompt(argument, state)
         solved_key = argument.strip()
         return select_normal(solved_key, state)
     elif operator == OPERATOR_COALESCE:
         # if the value is empty, it replaces it with the first non-empty value from the list
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"Coalesce operator requires at least one key|value format: '{argument}'")
         key = parts[0].strip()
@@ -603,7 +727,7 @@ def resolve_operator(text: str, state: dict) -> str:
         return ""
     elif operator.isdigit(): # OPERATOR INDEX
         index = int(operator)
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 1:
             raise PromptError(f"Index operator requires at least key|default_value format: '{argument}'")
         key = parts[0].strip()
@@ -624,7 +748,7 @@ def resolve_operator(text: str, state: dict) -> str:
             return default_value
     elif operator == OPERATOR_EXCEPT:
         # Format: {^:key|exclude_value|default_value}
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"Except operator requires at least key|exclude_value format: '{argument}'")
         key = parts[0].strip()
@@ -634,27 +758,27 @@ def resolve_operator(text: str, state: dict) -> str:
     elif (operator in MAYBE_OPERATORS) or (operator.endswith("?")):
         # syntaxes: {maybe:chance|key} or {50?:key} or just {?:key} (50% chance) or {key?} (50% chance)
         chance = 50 
-        argument = argument.strip()
-        if argument.startswith("{"):
-            argument = process_prompt(argument, state)
-            return operator_maybe("{#:" + argument + "}", chance=chance)
-        key_part = argument
+        if not operator.startswith("?") and operator[:-1].isdigit():
+            chance = int(operator[:-1])
         if "|" in argument:
-            parts = argument.split("|")
+            # lets check if we have only number before |
+            parts = split_args_same_level(argument, "|")
+            if len(parts) < 2:
+                raise PromptError(f"Maybe operator requires chance|key format: '{argument}'")
             chance_part = parts[0].strip()
-            key_part = parts[1].strip()
+            key_part = parts[1]
             if chance_part.isdigit():
                 chance = int(chance_part)
+                argument = key_part
             else:
-                raise PromptError(f"Chance value must be an integer: '{chance_part}'")
-        elif operator[:-1].isdigit():
-            chance = int(operator[:-1])
+                raise PromptError(f"Chance value must be an integer")
+        key_part = argument
         if "{" in key_part:
             key_part = process_prompt(key_part, state)
         return operator_maybe(key_part, chance=chance)
     elif (operator in REPEAT_OPERATORS):
         # syntaxes: {repeat:count|text} or {x:count|text}
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"Repeat operator requires count|text format: '{argument}'")
         count_part = parts[0].strip()
@@ -670,7 +794,7 @@ def resolve_operator(text: str, state: dict) -> str:
             prefix_part, _, store_op = operator.rpartition(",")
             prefix = prefix_part
             operator = store_op
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"Store operator requires key|text format: '{argument}'")
         key = parts[0].strip()
@@ -678,7 +802,7 @@ def resolve_operator(text: str, state: dict) -> str:
         return operator_store(key, text, state, prefix=prefix)
     elif operator in TRACK_OPERATORS:
         # syntaxes: {track:name|text} or {tk:name|text}
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"Track operator requires name|text format: '{argument}'")
         track_name = parts[0].strip()
@@ -686,7 +810,7 @@ def resolve_operator(text: str, state: dict) -> str:
         return operator_track(text, track_name, state)
     elif operator in OPTIONAL_OPERATORS:
         # syntaxes: {optional:key|default} or {opt:key|default}
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 2:
             raise PromptError(f"Optional operator requires key|default format: '{argument}'")
         key = parts[0].strip()
@@ -702,7 +826,7 @@ def resolve_operator(text: str, state: dict) -> str:
         return ""
     elif operator in COND_OPERATORS:
         # syntaxes: {cond:key|value|text} or {if:key|value|text}
-        parts = argument.split("|")
+        parts = split_args_same_level(argument, "|")
         if len(parts) < 3:
             raise PromptError(f"Conditional operator requires key|value|text format: '{argument}'")
         key = parts[0].strip()
@@ -713,8 +837,53 @@ def resolve_operator(text: str, state: dict) -> str:
         # syntaxes: {echo:text} or {print:text}
         text = argument
         return operator_echo(text, state)
+    elif operator in HOOKS_OPERATORS:
+        # syntaxes: {hook:name|text} or {call:name|text} or {exec:name|text}
+        parts = split_args_same_level(argument, "|")
+        if len(parts) < 2:
+            raise PromptError(f"Hook operator requires name|text format: '{argument}'")
+        name = parts[0].strip()
+        text = parts[1]
+        return operator_hook(name, text, state)
+    elif operator in INCREMENT_OPERATORS:
+        # syntaxes: {inc:key} or {increment:key}
+        key = argument.strip()
+        return operator_increment(key, state)
+    elif operator in DECREMENT_OPERATORS:
+        # syntaxes: {dec:key} or {decrement:key}
+        key = argument.strip()
+        return operator_decrement(key, state)
+    elif operator == OPERATOR_SUM:
+        # syntaxes: {sum:left|right}
+        parts = split_args_same_level(argument, "|")
+        if len(parts) < 2:
+            raise PromptError(f"Sum operator requires left|right format: '{argument}'")
+        left = parts[0].strip()
+        right = parts[1].strip()
+        return operator_sum(left, right, state)
+    elif operator == OPERATOR_SUBTRACT:
+        # syntaxes: {sub:left|right}
+        parts = split_args_same_level(argument, "|")
+        if len(parts) < 2:
+            raise PromptError(f"Subtract operator requires left|right format: '{argument}'")
+        left = parts[0].strip()
+        right = parts[1].strip()
+        return operator_subtract(left, right, state)
     else:
         raise PromptError(f"Unknown operator '{operator}' in prompt.")
+    
+def first_operator(text: str) -> str:
+    # Find the first colon to identify the potential operator
+    colon_index = text.find(":")
+    if colon_index == -1:
+        return ""
+    # Check if { or } appear before the colon
+    open_brace_index = text.find("{")
+    close_brace_index = text.find("}")
+    if (open_brace_index != -1 and open_brace_index < colon_index) or (close_brace_index != -1 and close_brace_index < colon_index):
+        return ""
+    # Return the operator (part before the colon)
+    return text[:colon_index].strip()
 
 def process_prompt(prompt: str, state: dict, inside_bracets=False) -> str:
     if inside_bracets: 
@@ -727,6 +896,13 @@ def process_prompt(prompt: str, state: dict, inside_bracets=False) -> str:
                 raise PromptError(f"Conditional operator requires key|value|text format: '{prompt}'")
             key, value, text = parts[0], parts[1], "|".join(parts[2:])
             return operator_conditional(key, value, text, state)
+        fst_op = first_operator(prompt)
+        if fst_op:
+            return resolve_operator(prompt, state)
+        if "|" in prompt:
+            parts = split_args_same_level(prompt, "|")
+            if len(parts) > 1:
+                return resolve_operator(prompt, state)
     result = prompt
     while "{" in result:
         inner_content = eat_next_bracets(result)
@@ -736,8 +912,8 @@ def process_prompt(prompt: str, state: dict, inside_bracets=False) -> str:
         # Replace only the first occurrence to ensure proper ordering
         result = result.replace("{" + inner_content + "}", processed, 1)
     if inside_bracets:
-        return resolve_operator(result, state).strip()
-    return result.strip()
+        return resolve_operator(result, state)
+    return result
 
 def postprocess_prompt(prompt: str, template: dict) -> str:
     # remove duplicate spaces
@@ -905,6 +1081,12 @@ def initialize_template(template: dict, kwargs: dict = {}) -> dict:
         template["templates"] = {}
     if "data" not in template["templates"]:
         template["templates"]["data"] = {}
+    if "hooks" in template["templates"]:
+        raise PromptError("Template 'hooks' key is reserved!")
+    if "hooks" in kwargs:
+        template["templates"]["hooks"] = kwargs["hooks"]
+    else:
+        template["templates"]["hooks"] = {}
 
     # template.data keys cannot store "meta_" keys
     for key in template["templates"]["data"].keys():
@@ -1009,79 +1191,45 @@ def ensure_template_dict(template: typing.Union[str, dict]) -> dict:
     #   }
     # }
     # ```
-    # or
-    # ```template.key_name
-    # content of the template
-    # ```
-    # all the text outside the ```json ... ``` and ```template... ``` is the entrypoint text that will be added to the extracted json at the field "entrypoint"
+    # all the text outside the ```json ... ``` is the entrypoint text that we be added to the extracted json at the field "entrypoint"
     lines = template.splitlines()
-    inside_json_block = False
-    inside_template_block = False
-    json_block_lines = []
-    template_block_lines = []
+    inside_code_block = False
+    code_block_lines = []
     entrypoint_lines = []
-    json_block_found = False
-    current_template_name = None
-    template_data = {}
+    code_block_found = False
     for line in lines:
         stripped_line = line.strip()
         if stripped_line.startswith("```json"):
-            if json_block_found:
+            if code_block_found:
                 raise PromptError("Multiple JSON code blocks found in template string.")
-            inside_json_block = True
-            json_block_found = True
+            inside_code_block = True
+            code_block_found = True
             continue
-        elif stripped_line.startswith("```template."):
-            if inside_template_block:
-                raise PromptError("Nested template blocks found in template string.")
-            inside_template_block = True
-            template_name = stripped_line[len("```template."):].strip()
-            if not template_name:
-                raise PromptError("Template block must have a name after '```template.'.")
-            current_template_name = template_name
-            template_block_lines = []
+        elif stripped_line.startswith("```") and inside_code_block:
+            inside_code_block = False
             continue
-        elif stripped_line.startswith("```") and inside_json_block:
-            inside_json_block = False
-            continue
-        elif stripped_line.startswith("```") and inside_template_block:
-            inside_template_block = False
-            if current_template_name:
-                template_data[current_template_name] = "\n".join(template_block_lines).strip()
-            current_template_name = None
-            continue
-        if inside_json_block:
-            json_block_lines.append(line)
-        elif inside_template_block:
-            template_block_lines.append(line)
+        if inside_code_block:
+            code_block_lines.append(line)
         else:
             entrypoint_lines.append(line)
-    if inside_template_block:
-        raise PromptError("Unclosed template block in template string.")
-    json_block_content = "\n".join(json_block_lines).strip()
+    code_block_content = "\n".join(code_block_lines).strip()
     entrypoint_content = "\n".join(entrypoint_lines).strip()
-    if not json_block_content and not template_data:
-        raise PromptError("No JSON code block or template blocks found in template string.")
-    if json_block_content:
-        try:
-            template_dict = json.loads(json_block_content)
-        except Exception as e:
-            raise PromptError(f"Failed to parse JSON code block in template string: {e}")
-    else:
-        template_dict = {}
+    if not code_block_content:
+        raise PromptError("No JSON code block found in template string.")
+    try:
+        template_dict = json.loads(code_block_content)
+    except Exception as e:
+        raise PromptError(f"Failed to parse JSON code block in template string: {e}")
     if entrypoint_content:
         template_dict["entrypoint"] = entrypoint_content
     else:
-        raise PromptError("No entrypoint content found outside code blocks in template string.")
+        raise PromptError("No entrypoint content found outside JSON code block in template string.")
     if "templates" not in template_dict:
         template_dict["templates"] = {
             "data": {}
         }
     elif "data" not in template_dict["templates"]:
         template_dict["templates"]["data"] = {}
-    # Add template data to the template dict
-    for key, value in template_data.items():
-        template_dict["templates"]["data"][key] = value
     return template_dict
 
 
@@ -1115,6 +1263,7 @@ def generate_prompt(
         num_prompts: int = 1,
         num_continues: int = 0,
 ) -> dict:
+    global GLOBAL_UNIQUE_STATE 
     template = ensure_template_dict(template)
     if seed is None or seed < 1:
         seed = int(time.time() * 1000) + random.randint(0, 1 << 30)
@@ -1130,9 +1279,21 @@ def generate_prompt(
     # if continue > 0, we can not allow wkars keys starting with meta_last_ because they would interfere with the continuation logic
 
     include_lists = []
-
+    kwargs = copy.deepcopy(kwargs)
     key_list = list(kwargs.keys())
     for key in key_list:  # use list to avoid modification during iteration
+        if key == "hooks":
+            if not isinstance(kwargs[key], dict):
+                raise PromptError(f"Argument key 'hooks' must be a dictionary.")
+            hooks_dict = kwargs[key]
+            for hook_name, hook_value in hooks_dict.items():
+                if not isinstance(hook_value, typing.Callable):
+                    raise PromptError(f"Hook '{hook_name}' must be a callable/function.")
+        elif not isinstance(kwargs[key], str):
+            raise PromptError(f"Argument key '{key}' must be a string.")
+        else:
+            kwargs[key] = escape_special_characters(kwargs[key])
+
         if key.startswith("meta_"):
             raise PromptError(f"Argument key '{key}' cannot start with 'meta_'. This prefix is reserved for metadata.")
         if num_continues > 0 and key.startswith("meta_last_"):
@@ -1140,8 +1301,6 @@ def generate_prompt(
         if key.startswith("follow-list-of-"):
             value = kwargs[key]
             del kwargs[key]
-            if not isinstance(value, str):
-                raise PromptError(f"Argument key '{key}' must be a string when using multiple prompts.")
             name = key[len("follow-list-of-"):]
             values = []
             for v in value.split("\n"):
@@ -1160,6 +1319,7 @@ def generate_prompt(
         progress = None
     meta_lasts = {}
     for p_number in range(num_prompts):
+        GLOBAL_UNIQUE_STATE = {}  # global state persist for continues only, reset for each new prompt
         if include_lists:
             for name, values in include_lists:
                 index = p_number % len(values)
@@ -1232,16 +1392,11 @@ def _generate_prompt_implementation(
 
     kwargs_processed = {}
     for key, value in kwargs.items():
-        # lets assert all parameters are string only type
-        if not isinstance(value, str):
-            raise PromptError(f"Argument key '{key}' must be of type string. Found type: {type(value)}")
-        if "regex_" in key:
-            raise PromptError(f"Argument key '{key}' cannot contain 'regex_'. This prefix is reserved.")
         if key.startswith("meta_"):
             # lets remove the meta_ prefix for processing
-            kwargs_processed[key[len("meta_"):]] = escape_special_characters(value)
+            kwargs_processed[key[len("meta_"):]] = value
         else:
-            kwargs_processed[key] = escape_special_characters(value)
+            kwargs_processed[key] = value
     kwargs = kwargs_processed
 
     template = initialize_template(template, kwargs)

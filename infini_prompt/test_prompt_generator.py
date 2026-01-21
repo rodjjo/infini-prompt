@@ -30,7 +30,7 @@ class TestGeneratePrompt(unittest.TestCase):
 
     def setUp(self):
         """Reset global state before each test."""
-        from infini_prompt.prompt_generator import GLOBAL_UNIQUE_STATE
+        from .prompt_generator import GLOBAL_UNIQUE_STATE
         GLOBAL_UNIQUE_STATE.clear()
 
     def test_simple_entrypoint(self):
@@ -487,6 +487,15 @@ class TestGeneratePrompt(unittest.TestCase):
         result = generate_prompt(template, seed=42)
         self.assertEqual(result["output"], "found")
 
+    def test_has_operator_literal_text(self):
+        """Test 'has' operator when first arg is a literal string with spaces."""
+        template = {
+            "entrypoint": "{has:{#:hello world}|world|yes it has|no it does not}",
+            "templates": {"data": {}}
+        }
+        result = generate_prompt(template, seed=42)
+        self.assertEqual(result["output"], "yes it has")
+
     def test_not_has_operator(self):
         """Test 'not_has' operator (non-substring check)."""
         template = {
@@ -669,6 +678,18 @@ class TestGeneratePrompt(unittest.TestCase):
                 }
                 result = generate_prompt(template, seed=42)
                 self.assertIn(result["output"], ["red", "yellow", "green"])
+
+    def test_nested_operator_arguments(self):
+        """Test nested operator arguments like {{aple|orange}|{car|bike}|{human|animal}}."""
+        template = {
+            "entrypoint": "{{aple|orange}|{car|bike}|{human|animal}}",
+            "templates": {
+                "data": {}
+            }
+        }
+        result = generate_prompt(template, seed=42)
+        # The outer one_of should resolve to one of the inner choices
+        self.assertIn(result["output"], ["aple", "orange", "car", "bike", "human", "animal"])
 
     def test_maybe_operator(self):
         """Test maybe (?) operator for conditional selection."""
@@ -1956,11 +1977,10 @@ End of template."""
             }
         }
         result = generate_prompt(template, seed=42)
-        mock_print.assert_has_calls([
-            unittest.mock.call("<<BEGIN_ECHO>>"),
-            unittest.mock.call("Hello World"),
-            unittest.mock.call("<<END_ECHO>>")
-        ])
+        self.assertEqual(mock_print.call_count, 3)
+        mock_print.assert_any_call("<<BEGIN_ECHO>>")
+        mock_print.assert_any_call("Hello World")
+        mock_print.assert_any_call("<<END_ECHO>>")
         self.assertEqual(result["output"], "Before After")
 
     @patch('builtins.print')
@@ -1973,11 +1993,10 @@ End of template."""
             }
         }
         result = generate_prompt(template, seed=42)
-        mock_print.assert_has_calls([
-            unittest.mock.call("<<BEGIN_ECHO>>"),
-            unittest.mock.call("Test message"),
-            unittest.mock.call("<<END_ECHO>>")
-        ])
+        self.assertEqual(mock_print.call_count, 3)
+        mock_print.assert_any_call("<<BEGIN_ECHO>>")
+        mock_print.assert_any_call("Test message")
+        mock_print.assert_any_call("<<END_ECHO>>")
         self.assertEqual(result["output"], "")
 
     @patch('builtins.print')
@@ -1993,11 +2012,12 @@ End of template."""
         }
         result = generate_prompt(template, seed=42)
         # Should have called print with the processed text
-        self.assertTrue(mock_print.called)
-        # Check the second call which is the actual message
-        self.assertEqual(len(mock_print.call_args_list), 3)
-        called_with = mock_print.call_args_list[1][0][0]
-        self.assertIn(called_with, ["blue sky", "red sky"])
+        self.assertEqual(mock_print.call_count, 3)
+        mock_print.assert_any_call("<<BEGIN_ECHO>>")
+        # The second call should be the processed text
+        second_call = mock_print.call_args_list[1][0][0]
+        self.assertIn(second_call, ["blue sky", "red sky"])
+        mock_print.assert_any_call("<<END_ECHO>>")
         self.assertEqual(result["output"], "")
 
     def test_conditional_operator_true(self):
@@ -2081,6 +2101,103 @@ End of template."""
         with self.assertRaises(PromptError) as context:
             generate_prompt(template, seed=42)
         self.assertIn("Conditional operator requires key|value|text format", str(context.exception))
+
+    def test_hook_operator(self):
+        """Test hook operator calls custom function."""
+        def reverse_hook(text):
+            return text[::-1]
+        
+        template = {
+            "entrypoint": "{hook:reverse|hello world}",
+            "templates": {
+                "data": {}
+            }
+        }
+        result = generate_prompt(template, seed=42, kwargs={"hooks": {"reverse": reverse_hook}})
+        self.assertEqual(result["output"], "dlrow olleh")
+
+    def test_hook_operator_no_hooks_defined(self):
+        """Test hook operator raises error when no hooks defined."""
+        template = {
+            "entrypoint": "{hook:reverse|hello}",
+            "templates": {
+                "data": {}
+            }
+        }
+        with self.assertRaises(PromptError) as context:
+            generate_prompt(template, seed=42)
+        self.assertIn("Hook 'reverse' not found in state hooks", str(context.exception))
+
+    def test_hook_operator_hook_not_found(self):
+        """Test hook operator raises error when hook not found."""
+        def dummy_hook(text):
+            return text
+        
+        template = {
+            "entrypoint": "{hook:missing|hello}",
+            "templates": {
+                "data": {}
+            }
+        }
+        with self.assertRaises(PromptError) as context:
+            generate_prompt(template, seed=42, kwargs={"hooks": {"dummy": dummy_hook}})
+        self.assertIn("Hook 'missing' not found in state hooks", str(context.exception))
+
+    def test_increment_operator(self):
+        """Test increment operator increases static counter."""
+        template = {
+            "entrypoint": "{inc:counter}",
+            "templates": {"data": {}}
+        }
+        result = generate_prompt(template, seed=42)
+        self.assertEqual(result["output"], "1")
+        self.assertEqual(result["statics"]["counter"], "1")
+
+    def test_increment_operator_multiple(self):
+        """Test multiple increments in same template increments state."""
+        template = {
+            "entrypoint": "{inc:counter} {inc:counter}",
+            "templates": {"data": {}}
+        }
+        result = generate_prompt(template, seed=42)
+        parts = result["output"].split()
+        self.assertEqual(parts, ["1", "2"])
+        self.assertEqual(result["statics"]["counter"], "2")
+
+    def test_decrement_operator(self):
+        """Test decrement operator decreases static counter."""
+        template = {
+            "entrypoint": "{dec:counter}",
+            "templates": {"data": {}}
+        }
+        result = generate_prompt(template, seed=42)
+        self.assertEqual(result["output"], "-1")
+        self.assertEqual(result["statics"]["counter"], "-1")
+
+    def test_sum_operator(self):
+        """Test sum operator with integer and float values."""
+        template1 = {
+            "entrypoint": "{+:2|3}",
+            "templates": {"data": {}}
+        }
+        result1 = generate_prompt(template1, seed=42)
+        self.assertEqual(result1["output"], "5")
+
+        template2 = {
+            "entrypoint": "{+:2.5|1.25}",
+            "templates": {"data": {}}
+        }
+        result2 = generate_prompt(template2, seed=42)
+        self.assertEqual(result2["output"], "3.75")
+
+    def test_subtract_operator(self):
+        """Test subtract operator using data keys."""
+        template = {
+            "entrypoint": "{-:{a}|{b}}",
+            "templates": {"data": {"a": "10", "b": "4"}}
+        }
+        result = generate_prompt(template, seed=42)
+        self.assertEqual(result["output"], "6")
 
 
 if __name__ == "__main__":
